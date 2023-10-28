@@ -89,18 +89,23 @@ class TokenConfidence(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, allow_flash: bool) -> None:
+    def __init__(self, att_type: str = "FLASH") -> None:
         super().__init__()
-        if allow_flash and not FLASH_AVAILABLE:
+        self.att_type = att_type
+
+        if self.att_type == "FLASH" and not FLASH_AVAILABLE:
             warnings.warn(
                 "FlashAttention is not available. For optimal speed, "
                 "consider installing torch >= 2.0 or flash-attn.",
                 stacklevel=2,
             )
-        self.enable_flash = allow_flash and FLASH_AVAILABLE
+        self.enable_flash = self.att_type == "FLASH" and FLASH_AVAILABLE    
 
         if FLASH_AVAILABLE:
-            torch.backends.cuda.enable_flash_sdp(allow_flash)
+            torch.backends.cuda.enable_flash_sdp(self.att_type == "FLASH")
+        
+        if self.att_type == "PERF":
+            self.fast_attention = FastAttention(dim_heads, nb_features, ortho_scaling, causal, generalized_attention, kernel_fn, no_projection)
 
     def forward(self, q, k, v, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.enable_flash and q.device.type == "cuda":
@@ -109,10 +114,13 @@ class Attention(nn.Module):
                 args = [x.half().contiguous() for x in [q, k, v]]
                 v = F.scaled_dot_product_attention(*args, attn_mask=mask).to(q.dtype)
                 return v if mask is None else v.nan_to_num()
-        elif FLASH_AVAILABLE:
-            args = [x.contiguous() for x in [q, k, v]]
-            v = F.scaled_dot_product_attention(*args, attn_mask=mask)
-            return v if mask is None else v.nan_to_num()
+            elif FLASH_AVAILABLE:
+                args = [x.contiguous() for x in [q, k, v]]
+                v = F.scaled_dot_product_attention(*args, attn_mask=mask)
+                return v if mask is None else v.nan_to_num()
+        elif self.att_type == "PERF":
+            # use FastAttention
+            v = self.fast_attention(q, k, v)    
         else:
             s = q.shape[-1] ** -0.5
             sim = torch.einsum("...id,...jd->...ij", q, k) * s
@@ -124,7 +132,7 @@ class Attention(nn.Module):
 
 class SelfBlock(nn.Module):
     def __init__(
-        self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True
+        self, embed_dim: int, num_heads: int, att_type: str = "FLASH", bias: bool = True
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -132,7 +140,7 @@ class SelfBlock(nn.Module):
         assert self.embed_dim % num_heads == 0
         self.head_dim = self.embed_dim // num_heads
         self.Wqkv = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
-        self.inner_attn = Attention(flash)
+        self.inner_attn = Attention(att_type)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.ffn = nn.Sequential(
             nn.Linear(2 * embed_dim, 2 * embed_dim),
@@ -159,7 +167,7 @@ class SelfBlock(nn.Module):
 
 class CrossBlock(nn.Module):
     def __init__(
-        self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True
+        self, embed_dim: int, num_heads: int, att_type: str = "FLASH", bias: bool = True
     ) -> None:
         super().__init__()
         self.heads = num_heads
@@ -175,8 +183,10 @@ class CrossBlock(nn.Module):
             nn.GELU(),
             nn.Linear(2 * embed_dim, embed_dim),
         )
-        if flash and FLASH_AVAILABLE:
-            self.flash = Attention(True)
+        if att_type == "FLASH" and FLASH_AVAILABLE:
+            self.flash = Attention("FLASH")
+        elif att_type == "FLASH" and FLASH_AVAILABLE:
+            self.flash = Attention("PERF")
         else:
             self.flash = None
 
@@ -311,7 +321,7 @@ class LightGlue(nn.Module):
         "descriptor_dim": 256,
         "n_layers": 9,
         "num_heads": 4,
-        "flash": False,  # enable FlashAttention if available.
+        "att_type": "FLASH",  # enable FlashAttention if available.
         "mp": False,  # enable mixed precision
         "depth_confidence": -1,  # early stopping, disable with -1
         "width_confidence": -1,  # point pruning, disable with -1
@@ -346,7 +356,7 @@ class LightGlue(nn.Module):
         h, n, d = conf.num_heads, conf.n_layers, conf.descriptor_dim
 
         self.transformers = nn.ModuleList(
-            [TransformerLayer(d, h, conf.flash) for _ in range(n)]
+            [TransformerLayer(d, h, conf.att_type) for _ in range(n)]
         )
 
         self.log_assignment = nn.ModuleList([MatchAssignment(d) for _ in range(n)])
@@ -552,7 +562,7 @@ class LightGlue(nn.Module):
         return ratio_confident > self.conf.depth_confidence
 
     def pruning_min_kpts(self, device: torch.device):
-        if self.conf.flash and FLASH_AVAILABLE and device.type == "cuda":
+        if self.conf.att_type and FLASH_AVAILABLE and device.type == "cuda":
             return self.pruning_keypoint_thresholds["flash"]
         else:
             return self.pruning_keypoint_thresholds[device.type]
