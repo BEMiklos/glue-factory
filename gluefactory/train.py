@@ -12,6 +12,7 @@ import signal
 from collections import defaultdict
 from pathlib import Path
 from pydoc import locate
+import wandb
 
 import numpy as np
 import torch
@@ -39,6 +40,8 @@ from .utils.tools import (
 
 # @TODO: Fix pbar pollution in logs
 # @TODO: add plotting during evaluation
+
+wandb.init(project='lightglue')
 
 default_train_conf = {
     "seed": "???",  # training seed
@@ -228,6 +231,7 @@ def training(rank, conf, output_dir, args):
     set_seed(conf.train.seed)
     if rank == 0:
         writer = SummaryWriter(log_dir=str(output_dir))
+        wandb.config.update(conf)
 
     data_conf = copy.deepcopy(conf.data)
     if args.distributed:
@@ -490,9 +494,11 @@ def training(rank, conf, output_dir, args):
                     )
                     for k, v in losses.items():
                         writer.add_scalar("training/" + k, v, tot_n_samples)
+                        wandb.log({f"training/{k}": v}, step=tot_n_samples)
                     writer.add_scalar(
                         "training/lr", optimizer.param_groups[0]["lr"], tot_n_samples
                     )
+                    wandb.log({"training/lr": optimizer.param_groups[0]["lr"], "training/epoch": epoch}, step=tot_n_samples)
                     writer.add_scalar("training/epoch", epoch, tot_n_samples)
 
             if conf.train.log_grad_every_iter is not None:
@@ -595,6 +601,10 @@ def training(rank, conf, output_dir, args):
                     stop,
                     args.distributed,
                 )
+
+                # Log best_eval to wandb
+                wandb.log({f"best_{conf.train.best_key}": best_eval}, step=tot_n_samples)
+
 
             if stop:
                 break
